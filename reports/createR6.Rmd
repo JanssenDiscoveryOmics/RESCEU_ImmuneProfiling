@@ -1,0 +1,551 @@
+---
+date: "`r format(Sys.time(), '%Y-%m-%d, %H:%M')`"
+output:
+  html_document:
+    code_folding: hide
+    df_print: paged
+params:
+  cytob.id:
+    label: Cytobank ID
+    value: NULL
+    input: text
+  spade.id:
+    label: SPADE ID, if SPADE clustering available
+    value: NULL
+    input: text
+  live.gate:
+    label: Gate used to gate to live cells
+    value: NULL
+    input: text
+  fcs.dir:
+    label: Path to the directory of processed data.
+    value: NULL
+    input: text
+  spade.suffix:
+    label: Regular expression of suffix to strip from FCS filenames after SPADE
+    value: NULL
+    input: text
+  annotation: 
+    label: Path to sample annotation
+    value: "annotation.txt"
+    input: file
+  markers: 
+    label: Path to marker annotation
+    value: "markers.txt"
+    input: file
+  gating: 
+    label: Path to gating XML
+    value: "gating.xml"
+    input: file
+  latest.gating: 
+    label: Path to gating XML
+    value: NULL
+    input: file
+  mst: 
+    label: Path to minimum spanning tree GML
+    value: "mst.gml"
+    input: file
+  bubbles: 
+    label: Path to bubbles RDS
+    value: "bubbles.rds"
+    input: file
+  metas: 
+    label: Path to metacluster RDS
+    value: "metas.rds"
+    input: file
+  info: 
+    label: Path to processing information YAML
+    value: "info.yaml"
+    input: file
+  author:
+    label: Author to include in the HTML report
+    value: ""
+    input: text
+  stringsAsFactors:
+    label: Convert strings to factor when reading in flat files?
+    value: FALSE
+    input: checkbox
+  overwrite:
+    label: Overwrite any CDF or RDS files with the same name and file path as this Rmd?
+    value: FALSE
+    input: checkbox
+knit: (function(input, ...) {
+    rmarkdown::render(
+      input,
+      output_file = paste0(xfun::sans_ext(input), '.html'),
+      envir = globalenv()
+    )
+  })    
+---
+
+---
+title: "Experiment `r as.character(params$cytob.id)`: Create `cytofData` Object`r if (!is.null(params$spade.id)) ' after SPADE Clustering'`"
+author: "`r params$author`"
+---
+
+```{r setup, include = FALSE}
+## chunk must be called setup for chunk options to be respected in html_notebook
+library(knitr)
+opts_chunk$set(message = FALSE, comment = "")
+library(BiocGenerics)
+```
+
+```{r shiny-setup, include = FALSE}
+## setup shiny progress bar
+progress <- requireNamespace("shiny", quietly = TRUE) && shiny::isRunning()
+n_progress <- 9
+```
+
+
+```{r info-lines, results = "asis", echo = FALSE}
+if (is.null(params$cytob.id)) stop("Cytobank ID must be specified")
+spade <- !is.null(params$spade.id)
+if (is.null(params$live.gate)) stop("Live gate must be specified")
+cat("__Cytobank ID__: ", as.character(params$cytob.id), "  \n", # need two spaces at eol
+    if (spade) paste("__SPADE ID__: ", as.character(params$spade.id), "  \n"),
+    "__Live gate__: ", as.character(params$live.gate), sep = "")
+```
+
+# Load Packages
+
+This notebook creates an R6 cytofData object from processed CyTOF data and 
+optionally the results of cell clustering (e.g. via SPADE). We require 
+the **ncdfFlow** package to work with ncdfFlowSets, **data.table** to read in 
+flat files (`.csv` or `.tsv`), **yaml** to read in YAML and **igraph** to read 
+in the minimum spanning tree from SPADE clustering, if available. The 
+**CytoML**, **flowWorkspace**, and **XML** packages are required to obtain 
+gating information. Finally **tibble** is used to display data frames, while
+**sessioninfo** and **tools** are used to handle session information and file 
+paths respectively.
+
+```{r packages, message = FALSE}
+library(cytofR6)
+required <- c("rmarkdown", "data.table", "yaml", "igraph"[spade],
+              "CytoML", "flowWorkspace", "XML",
+              "tibble", "sessioninfo", "tools")
+required_available <- sapply(required, require, quietly = TRUE, 
+                             character.only = TRUE)
+if (!all(required_available)) 
+  stop("The following packages must be installed to use the Rmd template\n", 
+       paste(required[!required_available], collapse = ", "))
+rm(required, required_available)
+```
+
+```{r session-info, include = FALSE}
+sess_info <- sessioninfo::session_info()
+```
+
+
+# Setup 
+
+```{r progress-setup, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Setup")
+```
+
+We check that the directory containing the FCS files has been specified and 
+define a directory for the outputs.
+
+```{r dir-setup}
+if (is.null(params$fcs.dir)) stop("FCS directory must be specified")
+# use fig.path to get user-specified output file & dir from `render()` call
+output.dir <- dirname(dirname(opts_chunk$get()$fig.path))
+# if dir not specified, use directory where Rmd is (knit working directory)
+if (output.dir == "."){
+  output.dir <- knitr::opts_knit$get("output.dir")
+  # if running interactively, use getwd() (= knit wd from RStudio)
+  if (is.null(output.dir)) output.dir <- getwd()
+}
+output.file <- sub("([^_]*)_files", "\\1", 
+                   basename(dirname(opts_chunk$get()$fig.path)))
+# check whether saving `cytofData` will overwrite existing files
+nc_exists <- file.exists(file.path(output.dir, paste0(output.file, ".nc")))
+rds_exists <- file.exists(file.path(output.dir, paste0(output.file, ".rds")))
+if (!params$overwrite && (nc_exists | rds_exists)){
+  stop("`params$overwrite` is `FALSE` yet ", output.dir, 
+       " contains:\n",
+       paste0(output.file, ".nc\n")[nc_exists],
+       paste0(output.file, ".rds\n")[rds_exists],
+       "Set `params$overwrite` to `TRUE` or change name/file path of .Rmd")
+}
+kable(data.frame(Name = c("FCS directory", "Output directory"),
+                 Path = c(params$fcs.dir, output.dir)))
+rm(rds_exists)
+```
+
+# Validating inputs
+
+```{r progress-validate, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Validating inputs")
+```
+
+Now we validate the latest gating file (if provided) and the sample annotation.
+
+## Latest gating file
+
+If an updated gating file has been specified, we check the live gate in the 
+this file against that used when processing the data - if the parameters 
+(defining channels) or boundaries have changed, the notebook will terminate.
+
+```{r check-gating}
+if (!is.null(params$latest.gating)){
+  if (md5sum(params$gating) != md5sum(params$latest.gating)){
+    # latest gating
+    doc <- xmlParse(params$latest.gating)
+    # get names of Boolean gates
+    gates <- xpathSApply(doc, "//gating:BooleanGate/descendant::name",
+                         xmlValue)
+    # id the one corresponding to the live gate
+    id <- which(gates == as.character(params$live.gate))
+    if (!length(id)) stop("Cannot find live gate in latest gating file.")
+    # get the IDs for gates contributing to live gate
+    gate_id <- xpathSApply(doc, 
+                           paste0("//gating:BooleanGate[", id,
+                                  "]/gating:and/gating:gateReference"),
+                           xmlGetAttr, "gating:ref")
+    # get the XML nodes corresponding to these gate IDs
+    nodes <- getNodeSet(doc, paste0("//*[@gating:id='", gate_id, "']", 
+                                    collapse = " | "))
+    names(nodes) <- xpathSApply(doc, paste0("//*[@gating:id='", gate_id,
+                                            "']/descendant::name", 
+                                            collapse = " | "), xmlValue)
+    
+    # old gating
+    doc0 <- xmlParse(params$gating)
+    # get names of Boolean gates
+    gates0 <- xpathSApply(doc0, "//gating:BooleanGate/descendant::name",
+                          xmlValue)
+    # id the one corresponding to the live gate
+    id0 <- which(gates0 == as.character(params$live.gate))
+    if (!length(id0)) stop("Cannot find live gate in gating file.")
+    # get the IDs for gates contributing to live gate
+    gate_id0 <- xpathSApply(doc0, 
+                            paste0("//gating:BooleanGate[", id0,
+                                   "]/gating:and/gating:gateReference"),
+                            xmlGetAttr, "gating:ref")
+    # get the XML nodes corresponding to these gate IDs
+    nodes0 <- getNodeSet(doc0, paste0("//*[@gating:id='", gate_id0, "']", 
+                                      collapse = " | "))
+    names(nodes0) <- xpathSApply(doc0, paste0("//*[@gating:id='", gate_id0,
+                                              "']/descendant::name", 
+                                              collapse = " | "), xmlValue)
+    
+    # compare gates
+    field.ok <- FALSE
+    if (setequal(names(nodes), names(nodes0))){
+      for (nm in names(nodes)){
+        field <- setdiff(names(nodes[[nm]]), c("custom_info"))
+        field.ok <- all.equal(nodes[[nm]][field], nodes0[[nm]][field])
+        if (!field.ok) break
+      }
+    }
+    if (!field.ok) 
+      stop("The live gate has changed since the CyTOF data were processed. ",
+           "Please extract features with the latest gating file.")
+    rm(gates, id, gate_id, nodes, gates0, id0, gate_id0, nodes0, 
+       field, field.ok, nm)
+    free(doc)
+    free(doc0)
+    rm(doc, doc0)
+  }
+  gate.file <- params$latest.gating
+} else gate.file <- params$gating
+```
+
+## Sample annotation
+
+We read in the sample annotation:
+
+```{r sample-annotation}
+ext <- file_ext(params$annotation)
+if (tolower(ext) == "rds"){
+  samples <- readRDS(params$annotation)
+} else {
+  samples <- fread(params$annotation, 
+                   data.table = FALSE,
+                   header = TRUE,
+                   stringsAsFactors = params$stringsAsFactors)
+}
+rm(ext)
+as_tibble(samples)
+```
+
+## Input files
+
+We match the names of the FCS file to the sample annotation - 
+if SPADE clustering has been applied, the suffix added to the FCS filenames 
+after clustering is removed before matching. Only annotated FCS files will be 
+included in the `cytofData` object.
+
+```{r match-annotation}
+input.files <- dir(params$fcs.dir, pattern = ".fcs$")
+if (spade){
+  if (!file.exists(params$mst)) 
+    stop(params$mst, " file does not exist")
+  spade.suffix <- params$spade.suffix
+  if (is.null(spade.suffix)) {
+    # escape special characters in live gate
+    tmp.live.gate <- gsub("([[:punct:]])", "\\\\\\1", 
+                          as.character(params$live.gate))
+    spade.suffix <- paste0("_", tmp.live.gate, ".*")
+  }
+  input.files <- grep(spade.suffix, input.files, value = TRUE)
+  id <- match(samples[[1]],
+              sub(paste0("(.*)", spade.suffix), "\\1.fcs", input.files), 
+              nomatch = 0L)
+} else {
+  id <- match(samples[[1]], input.files, nomatch = 0L)
+}
+# Throw error if annotated but not available
+if (any(id == 0L))
+  stop("Could not match first column of sample annotation to input files in\n",
+       params$fcs.dir,
+       if (spade)
+         paste0("\n\nRegular expression for suffix to strip from ",
+                "FCS file names:\n", spade.suffix),
+       "\n\nAnnotated samples with no match:\n",
+      paste(samples[[1]][id == 0L], collapse = "\n"))
+# Keep annotated FCS files only, drop note to user if filtering
+if (length(input.files) > length(!is.na(id)))
+  message("The following samples are excluded by the sample annotation file:\n",
+          paste(input.files[-id], collapse = "\n"))
+if (spade) rm(spade.suffix)
+tibble(`Input file` = input.files[id])
+```
+
+# Data structures
+
+Now we prepare the data structures required to create the `cytofData` object.
+
+## ncdfFlowSet
+
+```{r progress-readFCS, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Read in FCS files")
+```
+
+An `AnnotatedDataFrame` is created from the sample annotation, which is used 
+as the `phenoData` for a `ncdfFlowSet`:
+
+```{r read-FCS}
+annots <- as(cbind(data.frame(name = samples[[1]], 
+                              row.names = samples[[1]],
+                              stringsAsFactors = params$stringsAsFactors),
+                   samples[, -1]),
+             "AnnotatedDataFrame")
+if (params$overwrite || !nc_exists){ # only needed for interactive use
+  inputSet <- suppressMessages(
+    read.ncdfFlowSet(file.path(params$fcs.dir, input.files[id]), 
+                     phenoData = annots, 
+                     ncdfFile = file.path(output.dir, output.file))
+  )
+} else stop ("`params$overwrite` is `FALSE` and CDF file already exists")
+rm(annots, id, input.files, nc_exists, samples)
+inputSet
+```
+
+## Marker annotation
+
+The processed marker annotation is read in from the specified file:
+
+```{r marker-annot}
+markers <- fread(params$markers, 
+                 data.table = FALSE,
+                 header = TRUE,
+                 stringsAsFactors = params$stringsAsFactors)
+if (!all(c("name", "desc") %in% names(markers)))
+  stop("Please review the marker annotation file. It should include ",
+       "the columns 'name' and 'desc'.")
+as_tibble(markers)
+```
+
+## Populations
+
+```{r progress-gating, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Get gating information")
+```
+
+Gating information is obtained from the latest gating file available.
+
+```{r gating}
+suppressMessages(treeML <- read.gatingML.cytobank(gate.file))
+gatingSet <- GatingSet(inputSet)
+suppressMessages(gating(treeML, gatingSet))
+rm(inputSet, treeML)
+```
+
+We extract the corresponding population assignments.
+
+```{r progress-populations, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, 
+                     detail = "Extract latest population assignments")
+```
+
+```{r populations}
+nodes <- getNodes(gatingSet)
+populations <- lapply(gatingSet, function(gh){
+  cur.pops <- lapply(nodes, function(nd) getIndiceMat(gh, nd))
+  do.call(cbind, cur.pops)
+})
+populations <- do.call(rbind, populations)
+rm(nodes)
+str(populations)
+```
+
+## Bubbles
+
+```{r progress-bubbles, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Load and match bubbles")
+```
+
+If provided, bubbles are loaded and matched to cluster annotations.
+
+```{r bubbles, warning = FALSE}
+if (file.exists(params$bubbles)){
+  bubbles <- readRDS(params$bubbles)
+  clusters <- fsApply(getData(gatingSet)[, "cluster"], exprs)
+  bubbles <- lapply(bubbles, function(bub) clusters %in% unlist(bub))
+  bubbles <- do.call(cbind, bubbles)
+  if(!file.exists(params$metas)) {
+    rm(clusters)
+  }
+  str(bubbles)
+} else bubbles <- NULL
+```
+
+## Metaclusters
+
+```{r progress-metas, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Load and match bubbles")
+```
+
+If provided, metaclusters are loaded and matched to cluster annotations.
+
+```{r metas, warning = FALSE}
+if (file.exists(params$metas)){
+  metas <- readRDS(params$metas)
+  if(!"clusters" %in% ls()) {
+    clusters <- fsApply(getData(gatingSet)[, "cluster"], exprs)
+  }
+  metas <- lapply(metas, function(bub) clusters %in% unlist(bub))
+  metas <- do.call(cbind, metas)
+  rm(clusters)
+  str(metas)
+} else metas <- NULL
+```
+
+## Obtain Minimum Spanning Tree
+
+```{r progress-mst, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Obtain minimum spanning tree")
+```
+
+The minimum spanning tree is read in, if available.
+
+```{r mst}
+if (spade){
+  ## tree structure
+  mst <- read.graph(params$mst, format ="gml")
+  summary(mst)
+} else {
+  mst <- NULL
+}
+```
+
+## Update processing information
+
+```{r progress-info, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Update processing information")
+```
+
+We collate metadata on creating the `cytofData` object. If information has been 
+provided on previous processing, this is information is added as a separate 
+section:
+
+```{r info}
+# previous info
+if (file.exists(params$info)){
+  info <- read_yaml(params$info)
+} else info <- NULL
+# new info
+new_info <- list(
+  "Path to processed FCS files" = params$fcs.dir,
+  "Gating file (populations)" = gate.file,
+  "Sample annotation" = params$annotation,
+  "Marker annotation" = params$markers,
+  "Clustering" = ifelse(spade, "SPADE", "none"),
+  "Notebook version" = as.character(packageVersion("cytofR6")),
+  "Date" = format(Sys.Date(), "%Y-%m-%d"))
+if (is.character(unlist(info, recursive = FALSE))){
+  # only one level of YAML
+  info <- list(Processing = info, "Creating cytofData object" = new_info)
+} else {
+  info <- c(info, list("Creating cytofData object" = new_info))
+}
+rm(gate.file, new_info, spade)
+cat(as.yaml(info))
+```
+
+# Save results
+
+```{r progress-save, include = FALSE}
+if (progress)
+  shiny::incProgress(1/n_progress, detail = "Create and save R6 object")
+rm(n_progress, progress)
+```
+
+We create a cytofData R6 object containing the processed data, annotation, 
+population assignments, cell clustering and processing information. The result 
+is saved in the output directory: `r output.dir`, as the files listed below:
+
+```{r cytofData}
+## create R6 object
+cytof <- cytofData$new(cytofSet = getData(gatingSet),
+                       marker_data = markers,
+                       populations = populations,
+                       mst = mst,
+                       bubbles = bubbles,
+                       metaclusters = metas,
+                       info = info)
+cytof$save(output.file, cdf = "skip", dir = output.dir, 
+           overwrite = params$overwrite)
+tab <- data.frame(File = c(paste0(output.file, ".nc"), 
+                          paste0(output.file, ".rds")),
+                 Description = c("On disk cdf storage for processed CyTOF data",
+                                 "R6 object of processed CyTOF data"))
+rm(gatingSet, markers, populations, mst, bubbles, info, 
+   output.file, output.dir)
+kable(tab)
+```
+
+# Addendum
+
+This is notebook version `r as.character(packageVersion("cytofR6"))`.
+
+Platform information:
+```{r session-platform, warning = FALSE, echo = FALSE}
+kable(data.frame(configuration = names(sess_info$platform), 
+                 value = unlist(sess_info$platform),
+                 row.names = NULL))
+```
+
+R packages used: 
+```{r session-packages, warning = FALSE, echo = FALSE}
+keep <- c("package", "ondiskversion", "date", "source")
+tab <- as_tibble(unclass(sess_info$packages)[keep])
+colnames(tab)[2] <- "version"
+rm(sess_info, keep)
+kable(tab)
+```
+
+```{r clean-up, echo = FALSE}
+rm(tab)
+```
+  
